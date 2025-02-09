@@ -1,0 +1,24 @@
+[package]
+name = "binance_netflow"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+byteorder = "*"
+chrono = { version = "*", default-features = false, features = ["clock"] }
+crossterm = { version = "*", default-features = false }
+csv = "*"
+futures = "*"
+humantime = "*"
+num-format = "*"
+reqwest = { version = "*", default-features = false, features = ["json", "native-tls"] }
+serde = { version = "*", features = ["derive"], default-features = false }
+serde_json = "*"
+tokio = { version = "*", features = ["rt-multi-thread", "macros", "time", "fs", "sync"] }
+tokio-tungstenite = { version = "*", features = ["native-tls"] }
+
+[profile.release]
+opt-level = 3
+lto = true     
+panic = "abort"     
+codegen-units = 1
