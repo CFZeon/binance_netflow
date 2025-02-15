@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 byteorder = "*"
 chrono = { version = "*", default-features = false, features = ["clock"] }
-crossterm = { version = "*", default-features = false }
+crossterm = { version = "0.26.1", default-features = false }
 csv = "*"
 futures = "*"
 governor = { version = "*", default-features = false, features = ["std"] }
