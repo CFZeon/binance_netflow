@@ -708,8 +708,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Clone for UI spawn.
     let ui_log_buffer = log_buffer.clone();
 
+    // Process command-line arguments.
     let args: Vec<String> = env::args().collect();
-    if args.contains(&"--disable-api-log".to_string()) {
+    let mut disable_api_log = false;
+    for arg in args.iter().skip(1) { // Skip the program name
+        match arg.as_str() {
+            "--disable-api-log" => disable_api_log = true,
+            _ => {
+                eprintln!("Error: unrecognized argument: {}", arg);
+                eprintln!("Usage: {} [--disable-api-log]", args[0]);
+                std::process::exit(1);
+            }
+        }
+    }
+    if disable_api_log {
         API_LOG_ENABLED.store(false, Ordering::Relaxed);
     }
 
