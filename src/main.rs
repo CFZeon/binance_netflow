@@ -484,7 +484,7 @@ async fn refresh_symbols(
 }
 
 // ------------------------
-// CSV & checkpoint processing functions (update error types to be Send+Sync)
+// CSV & checkpoint processing functions (with explicit memory release)
 // ------------------------
 
 fn read_csv_records(file_path: &str) -> Result<Vec<CsvRecord>, Box<dyn std::error::Error + Send + Sync>> {
@@ -560,6 +560,7 @@ fn merge_and_update_csv(file_path: &str, new_aggregates: &BTreeMap<u64, AggTrade
     }
     let mut merged: Vec<CsvRecord> = existing_map.into_iter().map(|(_, rec)| rec).collect();
     merged.sort_by_key(|r| r.timestamp);
+    merged.shrink_to_fit();
     let file = OpenOptions::new().write(true).truncate(true).open(file_path)?;
     let mut writer = csv::Writer::from_writer(file);
     writer.write_record(&["timestamp", "start_atid", "end_atid", "net_flow"])?;
@@ -618,8 +619,11 @@ async fn process_csv_file(
             }
         }
     }
+    combined_missing_trades.shrink_to_fit();
     let new_aggregates = aggregate_missing_trades(&combined_missing_trades);
+    drop(combined_missing_trades);
     merge_and_update_csv(file_path, &new_aggregates)?;
+    drop(new_aggregates);
     let (new_checkpoint, _) = scan_csv_for_gaps(file_path)?;
     Ok(new_checkpoint)
 }
