@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use chrono::Utc;
 use csv::Writer;
 use futures::StreamExt;
+use futures::future::join_all;
 use governor::{
     clock::DefaultClock,
     state::{InMemoryState, NotKeyed},
@@ -935,7 +936,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ws_log_buffer = log_buffer.clone();
         push_log(&ws_log_buffer, "Fetching futures symbols...".to_string()).await;
         let futures_symbols_fetched = fetch_usdt_symbols(&http_client, true).await.unwrap_or_else(|e| {
-            // Log error and return empty vector.
             futures::executor::block_on(push_log(&ws_log_buffer, format!("Error fetching futures symbols: {}", e)));
             vec![]
         });
@@ -989,44 +989,101 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     {
-        let http_client = http_client.clone();
-        let futures_rate_limiter_clone = futures_rate_limiter.clone();
-        let spot_rate_limiter_clone = spot_rate_limiter.clone();
-        let checkpoint_log_buffer = log_buffer.clone();
+        // Clone separate instances for each inner spawn block.
+        let http_client_for_futures = http_client.clone();
+        let futures_rate_limiter_for_futures = futures_rate_limiter.clone();
+        let checkpoint_log_buffer_for_futures = log_buffer.clone();
+
+        let http_client_for_spot = http_client.clone();
+        let spot_rate_limiter_for_spot = spot_rate_limiter.clone();
+        let checkpoint_log_buffer_for_spot = log_buffer.clone();
+
+        let outer_checkpoint_log_buffer = checkpoint_log_buffer_for_futures.clone();
+
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(120)).await;
-            let mut checkpoints: BTreeMap<String, u64> = BTreeMap::new();
-            for market in &[MarketType::Futures, MarketType::Spot] {
-                let folder = format!("./{}", market_str(*market));
+
+            let futures_backfill = tokio::spawn(async move {
+                let mut local_checkpoints: BTreeMap<String, u64> = BTreeMap::new();
+                let folder = format!("./{}", market_str(MarketType::Futures));
                 if let Ok(entries) = fs::read_dir(&folder) {
-                    for entry in entries {
-                        if let Ok(entry) = entry {
-                            let path = entry.path();
-                            if path.extension().and_then(|s| s.to_str()) == Some("csv") {
-                                let file_path = path.to_str().unwrap().to_string();
-                                let symbol = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
-                                let rate_limiter = match market {
-                                    MarketType::Futures => futures_rate_limiter_clone.clone(),
-                                    MarketType::Spot => spot_rate_limiter_clone.clone(),
-                                };
-                                match process_csv_file(&file_path, &symbol, *market, http_client.clone(), rate_limiter, checkpoint_log_buffer.clone()).await {
+                    let mut tasks = Vec::new();
+                    for entry in entries.filter_map(Result::ok) {
+                        let path = entry.path();
+                        if path.extension().and_then(|s| s.to_str()) == Some("csv") {
+                            let file_path = path.to_str().unwrap().to_string();
+                            let symbol = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                            let rate_limiter = futures_rate_limiter_for_futures.clone();
+                            let http_client = http_client_for_futures.clone();
+                            let checkpoint_log_buffer = checkpoint_log_buffer_for_futures.clone();
+                            let task = tokio::spawn(async move {
+                                match process_csv_file(&file_path, &symbol, MarketType::Futures, http_client, rate_limiter, checkpoint_log_buffer.clone()).await {
                                     Ok(new_checkpoint) => {
-                                        checkpoints.insert(format!("{}:{}", symbol, market_str(*market)), new_checkpoint);
-                                        push_log(&checkpoint_log_buffer, format!("Data gaps filled. Checkpoint updated for {} {} to {}", market_str_short(*market), symbol, new_checkpoint)).await;
+                                        push_log(&checkpoint_log_buffer, format!("Data gaps filled. Checkpoint updated for {} {} to {}", market_str_short(MarketType::Futures), symbol, new_checkpoint)).await;
+                                        Some((format!("{}:{}", symbol, market_str(MarketType::Futures)), new_checkpoint))
                                     },
                                     Err(e) => {
                                         push_log(&checkpoint_log_buffer, format!("Error processing file {}: {}", file_path, e)).await;
+                                        None
                                     }
                                 }
-                            }
+                            });
+                            tasks.push(task);
                         }
                     }
+                    let results = join_all(tasks).await;
+                    for res in results.into_iter().filter_map(|r| r.ok().flatten()) {
+                        local_checkpoints.insert(res.0, res.1);
+                    }
                 }
-            }
-            if let Err(e) = update_checkpoint_file(&checkpoints, "checkpoint.json") {
-                push_log(&checkpoint_log_buffer, format!("Error updating checkpoint.json: {}", e)).await;
+                local_checkpoints
+            });
+
+            let spot_backfill = tokio::spawn(async move {
+                let mut local_checkpoints: BTreeMap<String, u64> = BTreeMap::new();
+                let folder = format!("./{}", market_str(MarketType::Spot));
+                if let Ok(entries) = fs::read_dir(&folder) {
+                    let mut tasks = Vec::new();
+                    for entry in entries.filter_map(Result::ok) {
+                        let path = entry.path();
+                        if path.extension().and_then(|s| s.to_str()) == Some("csv") {
+                            let file_path = path.to_str().unwrap().to_string();
+                            let symbol = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                            let rate_limiter = spot_rate_limiter_for_spot.clone();
+                            let http_client = http_client_for_spot.clone();
+                            let checkpoint_log_buffer = checkpoint_log_buffer_for_spot.clone();
+                            let task = tokio::spawn(async move {
+                                match process_csv_file(&file_path, &symbol, MarketType::Spot, http_client, rate_limiter, checkpoint_log_buffer.clone()).await {
+                                    Ok(new_checkpoint) => {
+                                        push_log(&checkpoint_log_buffer, format!("Data gaps filled. Checkpoint updated for {} {} to {}", market_str_short(MarketType::Spot), symbol, new_checkpoint)).await;
+                                        Some((format!("{}:{}", symbol, market_str(MarketType::Spot)), new_checkpoint))
+                                    },
+                                    Err(e) => {
+                                        push_log(&checkpoint_log_buffer, format!("Error processing file {}: {}", file_path, e)).await;
+                                        None
+                                    }
+                                }
+                            });
+                            tasks.push(task);
+                        }
+                    }
+                    let results = join_all(tasks).await;
+                    for res in results.into_iter().filter_map(|r| r.ok().flatten()) {
+                        local_checkpoints.insert(res.0, res.1);
+                    }
+                }
+                local_checkpoints
+            });
+
+            let futures_checkpoints = futures_backfill.await.unwrap();
+            let spot_checkpoints = spot_backfill.await.unwrap();
+            let mut combined_checkpoints = futures_checkpoints;
+            combined_checkpoints.extend(spot_checkpoints);
+
+            if let Err(e) = update_checkpoint_file(&combined_checkpoints, "checkpoint.json") {
+                push_log(&outer_checkpoint_log_buffer, format!("Error updating checkpoint.json: {}", e)).await;
             } else {
-                push_log(&checkpoint_log_buffer, "Checkpoints updated successfully.".to_string()).await;
+                push_log(&outer_checkpoint_log_buffer, "Checkpoints updated successfully.".to_string()).await;
             }
         });
     }
