@@ -17,6 +17,10 @@ serde = { version = "*", features = ["derive"], default-features = false }
 serde_json = "*"
 tokio = { version = "*", features = ["rt-multi-thread", "macros", "time", "fs", "sync"] }
 tokio-tungstenite = { version = "*", features = ["native-tls"] }
+clickhouse = { version = "0.13.2", features = ["inserter"] }
+
+[dev-dependencies]
+clickhouse = { version = "0.13.2", features = ["test-util"] }
 
 [profile.release]
 opt-level = 3

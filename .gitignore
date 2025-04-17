@@ -1,2 +1,5 @@
 .DS_Store
 encrypted_dot_DS_Store.age
+target
+Cargo.lock
+**/*.log

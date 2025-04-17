@@ -1,22 +1,20 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::env;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self};//, OpenOptions};
+// use std::io::Write;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::Utc;
-use csv::Writer;
 use futures::StreamExt;
-use futures::future::join_all;
+// use futures::future::join_all;
 use governor::{
     clock::DefaultClock,
     state::{InMemoryState, NotKeyed},
     Quota, RateLimiter,
 };
-use num_format::{Locale, ToFormattedString};
-use serde::{de, Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
@@ -28,6 +26,33 @@ use crossterm::{
 };
 use std::io::stdout;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+use std::path::PathBuf; // For better path manipulation
+use clickhouse::sql::Identifier;
+use clickhouse::{Client, Row}; // Import Inserter
+
+
+#[derive(Row, Deserialize, Serialize)]
+struct NetflowRow {
+    symbol: String,
+    timestamp: u64,
+    start_atid: u64, 
+    end_atid: u64,
+    net_flow: f64
+}
+
+#[derive(Row, Deserialize, Serialize)]
+struct NetflowGapsRow {
+    symbol: String,
+    timestamp_first: u64,
+    start_atid_first: u64, 
+    end_atid_first: u64,
+    net_flow_first: f64,
+    timestamp_second: u64,
+    start_atid_second: u64, 
+    end_atid_second: u64,
+    net_flow_second: f64
+}
 
 // ------------------------
 // Global constants & types
@@ -83,12 +108,9 @@ enum MarketType {
     Spot,
 }
 
-struct SymbolWriter {
-    writer: Writer<std::fs::File>,
-}
-
 #[derive(Debug, Clone)]
 struct AggTradeAggregate {
+    symbol: String,
     net_flow: f64,
     start_atid: Option<u64>,
     end_atid: Option<u64>,
@@ -130,31 +152,6 @@ struct Metrics {
     gaps_in_queue: AtomicUsize,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-struct Checkpoint {
-    symbol: String,
-    market: String,
-    end_atid_refpt: u64,
-}
-
-fn deserialize_net_flow<'de, D>(deserializer: D) -> Result<f64, D::Error>
-where
-    D: de::Deserializer<'de>,
-{
-    let s: String = String::deserialize(deserializer)?;
-    let s_clean = s.replace(",", "");
-    s_clean.parse::<f64>().map_err(de::Error::custom)
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CsvRecord {
-    timestamp: u64,
-    start_atid: u64,
-    end_atid: u64,
-    #[serde(deserialize_with = "deserialize_net_flow")]
-    net_flow: f64,
-}
-
 // ------------------------
 // Logging Support & Utility Functions
 // ------------------------
@@ -167,35 +164,153 @@ async fn push_log(log_buffer: &Arc<Mutex<VecDeque<String>>>, msg: String) {
     }
 }
 
-fn format_duration_millis(duration: Duration) -> String {
-    format!("{}ms", duration.as_millis())
-}
+// fn format_duration_millis(duration: Duration) -> String {
+//     format!("{}ms", duration.as_millis())
+// }
 
-fn format_duration_seconds(duration: Duration) -> String {
-    let secs = duration.as_secs();
-    if secs < 60 {
-        format!("{}s", secs)
-    } else if secs < 3600 {
-        let minutes = secs / 60;
-        let seconds = secs % 60;
-        format!("{}m {}s", minutes, seconds)
-    } else {
-        let hours = secs / 3600;
-        let minutes = (secs % 3600) / 60;
-        let seconds = secs % 60;
-        format!("{}h {}m {}s", hours, minutes, seconds)
+// fn format_duration_seconds(duration: Duration) -> String {
+//     let secs = duration.as_secs();
+//     if secs < 60 {
+//         format!("{}s", secs)
+//     } else if secs < 3600 {
+//         let minutes = secs / 60;
+//         let seconds = secs % 60;
+//         format!("{}m {}s", minutes, seconds)
+//     } else {
+//         let hours = secs / 3600;
+//         let minutes = (secs % 3600) / 60;
+//         let seconds = secs % 60;
+//         format!("{}h {}m {}s", hours, minutes, seconds)
+//     }
+// }
+
+fn aggregate_missing_trades(trades: &[AggTrade]) -> BTreeMap<u64, AggTradeAggregate> {
+    let mut aggregates = BTreeMap::new();
+    for trade in trades {
+        let trade_time_sec = trade.trade_timestamp / 1000;
+        let minute = (trade_time_sec / 60) * 60;
+        let price: f64 = trade.p.parse().unwrap_or(0.0);
+        let quantity: f64 = trade.q.parse().unwrap_or(0.0);
+        let net_flow = if trade.m { -price * quantity } else { price * quantity };
+
+        let entry = aggregates.entry(minute).or_insert(AggTradeAggregate {
+            symbol: trade.s.clone(),
+            net_flow: 0.0,
+            start_atid: None,
+            end_atid: None,
+            count: 0,
+        });
+        entry.net_flow += net_flow;
+        entry.count += 1;
+        if entry.start_atid.is_none() || trade.agg_trade_id < entry.start_atid.unwrap() {
+            entry.start_atid = Some(trade.agg_trade_id);
+        }
+        if entry.end_atid.is_none() || trade.agg_trade_id > entry.end_atid.unwrap() {
+            entry.end_atid = Some(trade.agg_trade_id);
+        }
     }
+    aggregates
 }
 
-fn format_net_flow(value: f64) -> String {
-    let net_flow_str = format!("{:.2}", value);
-    let parts: Vec<&str> = net_flow_str.split('.').collect();
-    let int_part = parts[0].parse::<i64>().unwrap_or(0);
-    let formatted_int = int_part.to_formatted_string(&Locale::en);
-    if parts.len() > 1 {
-        format!("{}.{}", formatted_int, parts[1])
-    } else {
-        formatted_int
+async fn update_clickhouse(mut clickhouse_inserter: clickhouse::inserter::Inserter<NetflowRow>, new_aggregates: &BTreeMap<u64, AggTradeAggregate>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    for (&minute, agg) in new_aggregates {
+            clickhouse_inserter.write(&NetflowRow { 
+                symbol: agg.symbol.clone(),
+                timestamp: minute * 1000,
+                start_atid: agg.start_atid.unwrap_or(0),
+                end_atid: agg.end_atid.unwrap_or(0),
+                net_flow: agg.net_flow,
+            }).unwrap();
+    }
+    let stats = clickhouse_inserter.commit().await.unwrap();
+    
+    if stats.rows > 0 {
+        println!(
+            "{} bytes, {} rows, {} transactions have been inserted",
+            stats.bytes, stats.rows, stats.transactions,
+        );
+    }
+    Ok(())
+}
+
+async fn handle_gaps_in_data(market: MarketType, clickhouse_client: clickhouse::Client, http_client: &reqwest::Client, rate_limiter: Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>) {
+    loop {
+        // fetch new data from clickhouse between rows where the gap is > 1
+        let mut cursor = clickhouse_client
+            .query("SELECT
+                    symbol,
+                    first.1 AS timestamp_first,
+                    first.2 AS start_atid_first,
+                    first.3 AS end_atid_first,
+                    first.4 AS net_flow_first,
+                    second.1 AS timestamp_second,
+                    second.2 AS start_atid_second,
+                    second.3 AS end_atid_second,
+                    second.4 AS net_flow_second
+                FROM (
+                    SELECT
+                        symbol,
+                        groupArray((timestamp, start_atid, end_atid, net_flow)) AS rows
+                    FROM NETFLOWS_base
+                    GROUP BY symbol
+                ) AS grouped
+                ARRAY JOIN
+                    arraySlice(rows, 1, length(rows) - 1) AS first,
+                    arraySlice(rows, 2, length(rows) - 1) AS second
+                WHERE second.2 - first.3 > 1 AND symbol = 'BTCUSDT'")
+            .fetch::<NetflowGapsRow>().unwrap();
+
+        // for each row, push it into an array
+        let mut gaps = Vec::new();
+        while let Some(row) = cursor.next().await.unwrap() {
+            gaps.push((row.symbol, row.end_atid_first+1, row.start_atid_second-1));
+        }
+        let mut combined_missing_trades = Vec::new();
+        for (symbol, missing_start, missing_end) in gaps {
+            // push_log(&log_buffer, format!("Identified data gaps in {} {}: {} to {}", market_str_short(market), symbol, missing_start, missing_end)).await;
+            let mut retry_delay = Duration::from_secs(5);
+            loop {
+                match fetch_missing_agg_trades(&http_client, &symbol, market, missing_start, missing_end, rate_limiter.clone()).await {
+                    Ok(trades) => {
+                        combined_missing_trades.extend(trades);
+                        break;
+                    }
+                    Err(e) => {
+                        // push_log(&log_buffer, format!("Error fetching missing trades for {} {}: {}. Retrying in {} seconds...", market_str(market), symbol, e, retry_delay.as_secs())).await;
+                        if e.to_string().contains("429") {
+                            retry_delay = std::cmp::min(retry_delay * 2, Duration::from_secs(60));
+                        } else {
+                            retry_delay = Duration::from_secs(5);
+                        }
+                        tokio::time::sleep(retry_delay).await;
+                    }
+                }
+            }
+        }
+        let new_aggregates = aggregate_missing_trades(&combined_missing_trades);
+        
+        let clickhouse_inserter: clickhouse::inserter::Inserter<NetflowRow>;
+        if market == MarketType::Futures {
+            clickhouse_inserter = clickhouse_client.inserter::<NetflowRow>("NETFLOWS_base").unwrap()
+                .with_timeouts(Some(Duration::from_secs(5)), Some(Duration::from_secs(20)))
+                .with_max_bytes(50_000_000)
+                .with_max_rows(750_000)
+                .with_period(Some(Duration::from_secs(15)));
+        }
+        else {
+            clickhouse_inserter = clickhouse_client.inserter::<NetflowRow>("NETFLOWS_base_spot").unwrap()
+                .with_timeouts(Some(Duration::from_secs(5)), Some(Duration::from_secs(20)))
+                .with_max_bytes(50_000_000)
+                .with_max_rows(750_000)
+                .with_period(Some(Duration::from_secs(15)));
+        }
+
+        // println!("{:#?}", new_aggregates);
+        update_clickhouse(clickhouse_inserter, &new_aggregates).await.unwrap();
+        // let (new_checkpoint, _) = scan_csv_for_gaps(&file_path)?;
+
+        // sleep for 30 minutes before checking again
+        tokio::time::sleep(Duration::from_secs(180)).await;
     }
 }
 
@@ -334,15 +449,15 @@ async fn fetch_usdt_symbols(client: &reqwest::Client, is_futures: bool) -> Resul
 
 fn market_str(market: MarketType) -> &'static str {
     match market {
-        MarketType::Futures => "futures",
-        MarketType::Spot => "spot",
+        MarketType::Futures => "",
+        MarketType::Spot => "_spot",
     }
 }
 
-fn market_str_short(market: MarketType) -> &'static str {
+fn is_market_spot(market: MarketType) -> bool {
     match market {
-        MarketType::Futures => "[F]",
-        MarketType::Spot => "[S]",
+        MarketType::Futures => false,
+        MarketType::Spot => true,
     }
 }
 
@@ -490,210 +605,61 @@ async fn spawn_ws_connections(
 }
 
 // ------------------------
-// CSV & Checkpoint Processing Functions
-// ------------------------
-
-fn aggregate_missing_trades(trades: &[AggTrade]) -> BTreeMap<u64, AggTradeAggregate> {
-    let mut aggregates = BTreeMap::new();
-    for trade in trades {
-        let trade_time_sec = trade.trade_timestamp / 1000;
-        let minute = (trade_time_sec / 60) * 60;
-        let price: f64 = trade.p.parse().unwrap_or(0.0);
-        let quantity: f64 = trade.q.parse().unwrap_or(0.0);
-        let net_flow = if trade.m { -price * quantity } else { price * quantity };
-
-        let entry = aggregates.entry(minute).or_insert(AggTradeAggregate {
-            net_flow: 0.0,
-            start_atid: None,
-            end_atid: None,
-            count: 0,
-        });
-        entry.net_flow += net_flow;
-        entry.count += 1;
-        if entry.start_atid.is_none() || trade.agg_trade_id < entry.start_atid.unwrap() {
-            entry.start_atid = Some(trade.agg_trade_id);
-        }
-        if entry.end_atid.is_none() || trade.agg_trade_id > entry.end_atid.unwrap() {
-            entry.end_atid = Some(trade.agg_trade_id);
-        }
-    }
-    aggregates
-}
-
-fn merge_and_update_csv(file_path: &str, new_aggregates: &BTreeMap<u64, AggTradeAggregate>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let existing = read_csv_records(file_path)?;
-    let mut existing_map: HashMap<u64, CsvRecord> = HashMap::new();
-    for rec in existing {
-        existing_map.insert(rec.timestamp, rec);
-    }
-    for (&minute, agg) in new_aggregates {
-        if !existing_map.contains_key(&minute) {
-            let new_record = CsvRecord {
-                timestamp: minute,
-                start_atid: agg.start_atid.unwrap_or(0),
-                end_atid: agg.end_atid.unwrap_or(0),
-                net_flow: agg.net_flow,
-            };
-            existing_map.insert(minute, new_record);
-        }
-    }
-    let mut merged: Vec<CsvRecord> = existing_map.into_iter().map(|(_, rec)| rec).collect();
-    merged.sort_by_key(|r| r.timestamp);
-    merged.shrink_to_fit();
-    let file = OpenOptions::new().write(true).truncate(true).open(file_path)?;
-    let mut writer = csv::Writer::from_writer(file);
-    writer.write_record(&["timestamp", "start_atid", "end_atid", "net_flow"])?;
-    for rec in merged {
-        writer.write_record(&[
-            rec.timestamp.to_string(),
-            rec.start_atid.to_string(),
-            rec.end_atid.to_string(),
-            format_net_flow(rec.net_flow),
-        ])?;
-    }
-    writer.flush()?;
-    Ok(())
-}
-
-fn read_csv_records(file_path: &str) -> Result<Vec<CsvRecord>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut reader = csv::Reader::from_path(file_path)?;
-    let mut records = Vec::new();
-    for result in reader.deserialize() {
-        let record: CsvRecord = result?;
-        records.push(record);
-    }
-    Ok(records)
-}
-
-fn scan_csv_for_gaps(file_path: &str) -> Result<(u64, Vec<(u64, u64)>), Box<dyn std::error::Error + Send + Sync>> {
-    let records = read_csv_records(file_path)?;
-    let mut gaps = Vec::new();
-    let mut prev_end: Option<u64> = None;
-    let mut checkpoint = 0;
-    for record in records.iter() {
-        if let Some(prev) = prev_end {
-            if record.start_atid > prev + 1 {
-                gaps.push((prev + 1, record.start_atid - 1));
-            }
-        }
-        prev_end = Some(record.end_atid);
-        checkpoint = record.end_atid;
-    }
-    Ok((checkpoint, gaps))
-}
-
-// process_csv_file now takes owned Strings and returns a 'static future.
-fn process_csv_file(
-    file_path: String,
-    symbol: String,
-    market: MarketType,
-    http_client: reqwest::Client,
-    rate_limiter: Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>,
-    log_buffer: Arc<Mutex<VecDeque<String>>>,
-) -> impl std::future::Future<Output = Result<u64, Box<dyn std::error::Error + Send + Sync>>> + 'static {
-    async move {
-        let (checkpoint, gaps) = scan_csv_for_gaps(&file_path)?;
-        if gaps.is_empty() {
-            return Ok(checkpoint);
-        }
-        let mut combined_missing_trades = Vec::new();
-        for (missing_start, missing_end) in gaps {
-            push_log(&log_buffer, format!("Identified data gaps in {} {}: {} to {}", market_str_short(market), symbol, missing_start, missing_end)).await;
-            let mut retry_delay = Duration::from_secs(5);
-            loop {
-                match fetch_missing_agg_trades(&http_client, &symbol, market, missing_start, missing_end, rate_limiter.clone()).await {
-                    Ok(trades) => {
-                        combined_missing_trades.extend(trades);
-                        break;
-                    }
-                    Err(e) => {
-                        push_log(&log_buffer, format!("Error fetching missing trades for {} {}: {}. Retrying in {} seconds...", market_str(market), symbol, e, retry_delay.as_secs())).await;
-                        if e.to_string().contains("429") {
-                            retry_delay = std::cmp::min(retry_delay * 2, Duration::from_secs(60));
-                        } else {
-                            retry_delay = Duration::from_secs(5);
-                        }
-                        tokio::time::sleep(retry_delay).await;
-                    }
-                }
-            }
-        }
-        let new_aggregates = aggregate_missing_trades(&combined_missing_trades);
-        merge_and_update_csv(&file_path, &new_aggregates)?;
-        let (new_checkpoint, _) = scan_csv_for_gaps(&file_path)?;
-        Ok(new_checkpoint)
-    }
-}
-
-fn update_checkpoint_file(checkpoints: &BTreeMap<String, u64>, checkpoint_file: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let checkpoint_vec: Vec<Checkpoint> = checkpoints.iter().map(|(key, &end_atid)| {
-        let mut parts = key.split(':');
-        let symbol = parts.next().unwrap_or_default().to_string();
-        let market = parts.next().unwrap_or("unknown").to_string();
-        Checkpoint { symbol, market, end_atid_refpt: end_atid }
-    }).collect();
-
-    let json = serde_json::to_string_pretty(&checkpoint_vec)?;
-    fs::write(checkpoint_file, json)?;
-    Ok(())
-}
-
-// ------------------------
 // UI Rendering Task
 // ------------------------
 
-async fn ui_render_loop(
-    metrics: Arc<Metrics>,
-    futures_symbols_list: Arc<Mutex<Vec<String>>>,
-    spot_symbols_list: Arc<Mutex<Vec<String>>>,
-    next_symbol_refresh_time: Arc<Mutex<SystemTime>>,
-    log_buffer: Arc<Mutex<VecDeque<String>>>,
-) -> crossterm::Result<()> {
-    let mut stdout = stdout();
-    loop {
-        let (cols, rows) = terminal_size()?;
-        stdout.execute(Clear(ClearType::All))?;
-        let logs = {
-            let buf = log_buffer.lock().await;
-            let total = buf.len();
-            let start = if total > (rows as usize - 1) { total - (rows as usize - 1) } else { 0 };
-            buf.iter().skip(start).cloned().collect::<Vec<_>>()
-        };
-        for (i, line) in logs.iter().enumerate() {
-            stdout.execute(MoveTo(0, i as u16))?;
-            write!(stdout, "{:<width$}", line, width = cols as usize)?;
-        }
-        let elapsed = Instant::now().duration_since(metrics.start_time);
-        let formatted_elapsed = format_duration_seconds(elapsed);
-        let last_batch = metrics.last_batch_records.load(Ordering::Relaxed);
-        let proc_time = *metrics.last_batch_processing_time.lock().await;
-        let formatted_proc_time = format_duration_millis(proc_time);
-        let missing = metrics.missing_gaps.load(Ordering::Relaxed);
-        let gaps = metrics.gaps_in_queue.load(Ordering::Relaxed);
-        let next_refresh_time = {
-            let lock = next_symbol_refresh_time.lock().await;
-            *lock
-        };
-        let now_sys = SystemTime::now();
-        let countdown = if next_refresh_time > now_sys {
-            next_refresh_time.duration_since(now_sys).unwrap()
-        } else {
-            Duration::from_secs(0)
-        };
-        let mins = countdown.as_secs() / 60;
-        let secs = countdown.as_secs() % 60;
-        let futures_count = futures_symbols_list.lock().await.len();
-        let spot_count = spot_symbols_list.lock().await.len();
-        let status_line = format!(
-            "Elapsed: {} | Last Batch: {} records | Proc Time: {} | Missing Gaps: {} | Gaps in Queue: {} | Refresh in: {:02}m:{:02}s | Futures: {} | Spot: {}",
-            formatted_elapsed, last_batch, formatted_proc_time, missing, gaps, mins, secs, futures_count, spot_count
-        );
-        stdout.execute(MoveTo(0, rows - 1))?;
-        write!(stdout, "{:<width$}", status_line, width = cols as usize)?;
-        stdout.flush()?;
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-}
+// async fn ui_render_loop(
+//     metrics: Arc<Metrics>,
+//     futures_symbols_list: Arc<Mutex<Vec<String>>>,
+//     spot_symbols_list: Arc<Mutex<Vec<String>>>,
+//     next_symbol_refresh_time: Arc<Mutex<SystemTime>>,
+//     log_buffer: Arc<Mutex<VecDeque<String>>>,
+// ) -> crossterm::Result<()> {
+//     let mut stdout = stdout();
+//     loop {
+//         let (cols, rows) = terminal_size()?;
+//         stdout.execute(Clear(ClearType::All))?;
+//         let logs = {
+//             let buf = log_buffer.lock().await;
+//             let total = buf.len();
+//             let start = if total > (rows as usize - 1) { total - (rows as usize - 1) } else { 0 };
+//             buf.iter().skip(start).cloned().collect::<Vec<_>>()
+//         };
+//         for (i, line) in logs.iter().enumerate() {
+//             stdout.execute(MoveTo(0, i as u16))?;
+//             write!(stdout, "{:<width$}", line, width = cols as usize)?;
+//         }
+//         let elapsed = Instant::now().duration_since(metrics.start_time);
+//         let formatted_elapsed = format_duration_seconds(elapsed);
+//         let last_batch = metrics.last_batch_records.load(Ordering::Relaxed);
+//         let proc_time = *metrics.last_batch_processing_time.lock().await;
+//         let formatted_proc_time = format_duration_millis(proc_time);
+//         let missing = metrics.missing_gaps.load(Ordering::Relaxed);
+//         let gaps = metrics.gaps_in_queue.load(Ordering::Relaxed);
+//         let next_refresh_time = {
+//             let lock = next_symbol_refresh_time.lock().await;
+//             *lock
+//         };
+//         let now_sys = SystemTime::now();
+//         let countdown = if next_refresh_time > now_sys {
+//             next_refresh_time.duration_since(now_sys).unwrap()
+//         } else {
+//             Duration::from_secs(0)
+//         };
+//         let mins = countdown.as_secs() / 60;
+//         let secs = countdown.as_secs() % 60;
+//         let futures_count = futures_symbols_list.lock().await.len();
+//         let spot_count = spot_symbols_list.lock().await.len();
+//         let status_line = format!(
+//             "Elapsed: {} | Last Batch: {} records | Proc Time: {} | Missing Gaps: {} | Gaps in Queue: {} | Refresh in: {:02}m:{:02}s | Futures: {} | Spot: {}",
+//             formatted_elapsed, last_batch, formatted_proc_time, missing, gaps, mins, secs, futures_count, spot_count
+//         );
+//         stdout.execute(MoveTo(0, rows - 1))?;
+//         write!(stdout, "{:<width$}", status_line, width = cols as usize)?;
+//         stdout.flush()?;
+//         tokio::time::sleep(Duration::from_millis(500)).await;
+//     }
+// }
 
 // ------------------------
 // Main Entry Point
@@ -701,12 +667,12 @@ async fn ui_render_loop(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut stdout = stdout();
-    stdout.execute(EnterAlternateScreen)?;
+    // let mut stdout = stdout();
+    // stdout.execute(EnterAlternateScreen)?;
     
     // Create shared log buffer.
     let log_buffer = Arc::new(Mutex::new(VecDeque::new()));
-    let ui_log_buffer = log_buffer.clone();
+    // let ui_log_buffer = log_buffer.clone();
 
     // Process command-line arguments.
     let args: Vec<String> = env::args().collect();
@@ -733,7 +699,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (trade_data_sender, mut trade_data_receiver) = mpsc::channel::<(MarketType, AggTrade)>(MAX_BUFFERED_RECORDS);
     let trade_aggregates = Arc::new(Mutex::new(BTreeMap::<(String, MarketType, u64), AggTradeAggregate>::new()));
-    let csv_writers = Arc::new(Mutex::new(HashMap::new()));
     let agg_trade_tracker = Arc::new(Mutex::new(AggTradeTracker::new()));
     let http_client = reqwest::Client::new();
 
@@ -762,24 +727,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let next_symbol_refresh_time = Arc::new(Mutex::new(SystemTime::now() + Duration::from_secs(3600)));
 
     // Spawn UI rendering loop.
-    {
-        let metrics_clone = metrics.clone();
-        let futures_symbols_list_clone = futures_symbols_list.clone();
-        let spot_symbols_list_clone = spot_symbols_list.clone();
-        let next_symbol_refresh_time_clone = next_symbol_refresh_time.clone();
-        let ui_log_buffer_clone = ui_log_buffer.clone();
-        tokio::spawn(async move {
-            if let Err(e) = ui_render_loop(metrics_clone, futures_symbols_list_clone, spot_symbols_list_clone, next_symbol_refresh_time_clone, ui_log_buffer_clone).await {
-                eprintln!("UI render loop error: {}", e);
-            }
-        });
+    // {
+    //     let metrics_clone = metrics.clone();
+    //     let futures_symbols_list_clone = futures_symbols_list.clone();
+    //     let spot_symbols_list_clone = spot_symbols_list.clone();
+    //     let next_symbol_refresh_time_clone = next_symbol_refresh_time.clone();
+    //     let ui_log_buffer_clone = ui_log_buffer.clone();
+    //     tokio::spawn(async move {
+    //         if let Err(e) = ui_render_loop(metrics_clone, futures_symbols_list_clone, spot_symbols_list_clone, next_symbol_refresh_time_clone, ui_log_buffer_clone).await {
+    //             eprintln!("UI render loop error: {}", e);
+    //         }
+    //     });
+    // }
+    // 1. Read the secret folder path from environment variable
+    // Using std::env::var which returns a Result
+    let secret_folder_path_str = env::var("SECRETFOLDER")
+        .map_err(|e| format!("Failed to read SECRETFOLDER env var: {}", e))?;
+
+    // Convert the string path to a PathBuf for easier joining
+    let secret_folder_path = PathBuf::from(secret_folder_path_str);
+
+    // 2. Read the IP address file
+    let ip_file_path = secret_folder_path.join("CLICKHOUSEIP.txt");
+    let ip_address = fs::read_to_string(&ip_file_path)
+        .map_err(|e| format!("Unable to read IP file {:?}: {}", ip_file_path, e))?
+        .trim() // Remove leading/trailing whitespace (like newlines)
+        .to_string(); // Convert back to String
+
+    if ip_address.is_empty() {
+        return Err("IP address read from file is empty after trimming".into());
     }
+
+    // 3. Read the password file
+    let pass_file_path = secret_folder_path.join("CLICKHOUSEPASS.txt");
+    let clickhouse_password = fs::read_to_string(&pass_file_path)
+        .map_err(|e| format!("Unable to read password file {:?}: {}", pass_file_path, e))?
+        .trim() // Remove leading/trailing whitespace
+        .to_string(); // Convert back to String
+
+    // Use format! for cleaner string construction
+    let url = format!("http://{}:8123", ip_address);
+
+    let clickhouse_client = Client::default()
+        .with_url(url) // Use the correctly constructed URL
+        .with_user("default")
+        .with_password(clickhouse_password); // Use the trimmed password
 
     // Spawn task for processing trades.
     {
         let start_minute_boundary = next_minute_boundary;
         let trade_aggregates = trade_aggregates.clone();
-        let csv_writers = csv_writers.clone();
+        // let csv_writers = csv_writers.clone();
         let metrics_clone = metrics.clone();
         let agg_trade_tracker = agg_trade_tracker.clone();
         let http_client = http_client.clone();
@@ -787,6 +785,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let spot_rate_limiter = spot_rate_limiter.clone();
         let missing_trade_sender = missing_trade_sender.clone();
         let proc_log_buffer = log_buffer.clone();
+
+
+        let mut clickhouse_inserter = clickhouse_client.inserter::<NetflowRow>("NETFLOWS_base")?
+            .with_timeouts(Some(Duration::from_secs(5)), Some(Duration::from_secs(20)))
+            .with_max_bytes(50_000_000)
+            .with_max_rows(750_000)
+            .with_period(Some(Duration::from_secs(15)));
+
+        let mut clickhouse_inserter_spot = clickhouse_client.inserter::<NetflowRow>("NETFLOWS_base_spot")?
+            .with_timeouts(Some(Duration::from_secs(5)), Some(Duration::from_secs(20)))
+            .with_max_bytes(50_000_000)
+            .with_max_rows(750_000)
+            .with_period(Some(Duration::from_secs(15)));
+        
         tokio::spawn(async move {
             let mut flush_interval = tokio::time::interval(Duration::from_secs(6));
             loop {
@@ -809,6 +821,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let mut aggregates_lock = trade_aggregates.lock().await;
                             let aggregate_entry = aggregates_lock.entry((symbol_for_key, market, trade_minute))
                                 .or_insert(AggTradeAggregate {
+                                    symbol: s.clone(),
                                     net_flow: 0.0,
                                     start_atid: None,
                                     end_atid: None,
@@ -886,35 +899,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if let Some(aggregate) = trade_aggregates.lock().await.remove(&key) {
                                     batch_record_count += aggregate.count;
                                     let (symbol, market, minute_ts) = key;
-                                    let market_str_val = market_str(market);
-                                    let csv_folder = format!("./{}", market_str_val);
-                                    fs::create_dir_all(&csv_folder).expect("Failed to create directory");
-                                    let filename = format!("{}/{}.csv", csv_folder, symbol.to_uppercase());
-                                    let mut csv_writers_lock = csv_writers.lock().await;
-                                    let writer_entry = csv_writers_lock.entry((symbol.clone(), market))
-                                        .or_insert_with(|| {
-                                            let file = OpenOptions::new()
-                                                .create(true)
-                                                .append(true)
-                                                .open(&filename)
-                                                .expect("Failed to open CSV file");
-                                            let mut writer = Writer::from_writer(file);
-                                            if let Ok(metadata) = fs::metadata(&filename) {
-                                                if metadata.len() == 0 {
-                                                    writer.write_record(&["timestamp", "start_atid", "end_atid", "net_flow"])
-                                                        .expect("Failed to write CSV header");
-                                                }
-                                            }
-                                            SymbolWriter { writer }
-                                        });
-                                    writer_entry.writer.write_record(&[
-                                        minute_ts.to_string(),
-                                        aggregate.start_atid.unwrap_or(0).to_string(),
-                                        aggregate.end_atid.unwrap_or(0).to_string(),
-                                        format_net_flow(aggregate.net_flow),
-                                    ]).expect("Failed to write CSV record");
-                                    writer_entry.writer.flush().expect("Failed to flush CSV writer");
+                                    let is_spot = is_market_spot(market);
+                                    if is_spot {
+                                        clickhouse_inserter_spot.write(&NetflowRow { 
+                                            symbol: symbol,
+                                            timestamp: minute_ts * 1000, 
+                                            start_atid: aggregate.start_atid.unwrap_or(0), 
+                                            end_atid: aggregate.end_atid.unwrap_or(0), 
+                                            net_flow: aggregate.net_flow}).unwrap();
+                                    }
+                                    else {
+                                        clickhouse_inserter.write(&NetflowRow { 
+                                            symbol: symbol, 
+                                            timestamp: minute_ts * 1000,
+                                            start_atid: aggregate.start_atid.unwrap_or(0), 
+                                            end_atid: aggregate.end_atid.unwrap_or(0), 
+                                            net_flow: aggregate.net_flow}).unwrap();
+                                    }
                                 }
+                            }
+                            let stats = clickhouse_inserter.commit().await.unwrap();
+                            if stats.rows > 0 {
+                                println!(
+                                    "{} bytes, {} rows, {} transactions have been inserted",
+                                    stats.bytes, stats.rows, stats.transactions,
+                                );
+                            }
+                            let spot_stats = clickhouse_inserter_spot.commit().await.unwrap();
+                            if spot_stats.rows > 0 {
+                                println!(
+                                    "{} bytes, {} rows, {} transactions have been inserted",
+                                    spot_stats.bytes, spot_stats.rows, spot_stats.transactions,
+                                );
                             }
                             let flush_duration = Instant::now().duration_since(flush_start);
                             *metrics_clone.last_batch_processing_time.lock().await = flush_duration;
@@ -930,6 +946,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let websocket_semaphore = Arc::new(tokio::sync::Semaphore::new(10));
 
     {
+        // probably the thread for updating and removing symbols
         let http_client = http_client.clone();
         let futures_symbols_list = futures_symbols_list.clone();
         let spot_symbols_list = spot_symbols_list.clone();
@@ -987,100 +1004,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     {
-        let http_client_for_futures = http_client.clone();
-        let futures_rate_limiter_for_futures = futures_rate_limiter.clone();
-        let checkpoint_log_buffer_for_futures = log_buffer.clone();
-
-        let http_client_for_spot = http_client.clone();
-        let spot_rate_limiter_for_spot = spot_rate_limiter.clone();
-        let checkpoint_log_buffer_for_spot = log_buffer.clone();
-
-        let outer_checkpoint_log_buffer = checkpoint_log_buffer_for_futures.clone();
-
+        // this part here will be for fetching gaps in the data, fetching the data from binance, then updating the rows
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(120)).await;
+            loop {
+                println!("Handling gaps now");
+                let futures_rate_limiter = futures_rate_limiter.clone();
+                let spot_rate_limiter = spot_rate_limiter.clone();
+                handle_gaps_in_data(MarketType::Futures, clickhouse_client.clone(), &http_client, futures_rate_limiter).await;
+                handle_gaps_in_data(MarketType::Spot, clickhouse_client.clone(), &http_client, spot_rate_limiter).await;
+                println!("Gaps handled");
 
-            let futures_backfill = tokio::spawn(async move {
-                let mut local_checkpoints: BTreeMap<String, u64> = BTreeMap::new();
-                let folder = format!("./{}", market_str(MarketType::Futures));
-                if let Ok(entries) = fs::read_dir(&folder) {
-                    let mut tasks = Vec::new();
-                    for entry in entries.filter_map(Result::ok) {
-                        let path = entry.path();
-                        if path.extension().and_then(|s| s.to_str()) == Some("csv") {
-                            let file_path = path.to_str().unwrap().to_string();
-                            let symbol = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
-                            let rate_limiter = futures_rate_limiter_for_futures.clone();
-                            let http_client = http_client_for_futures.clone();
-                            let checkpoint_log_buffer = checkpoint_log_buffer_for_futures.clone();
-                            let task = tokio::spawn(async move {
-                                match process_csv_file(file_path, symbol.clone(), MarketType::Futures, http_client, rate_limiter, checkpoint_log_buffer.clone()).await {
-                                    Ok(new_checkpoint) => {
-                                        push_log(&checkpoint_log_buffer, format!("Data gaps filled. Checkpoint updated for {} {} to {}", market_str_short(MarketType::Futures), symbol, new_checkpoint)).await;
-                                        Some((format!("{}:{}", symbol, market_str(MarketType::Futures)), new_checkpoint))
-                                    },
-                                    Err(e) => {
-                                        push_log(&checkpoint_log_buffer, format!("Error processing file {}: {}", path.to_str().unwrap(), e)).await;
-                                        None
-                                    }
-                                }
-                            });
-                            tasks.push(task);
-                        }
-                    }
-                    let results = join_all(tasks).await;
-                    for res in results.into_iter().filter_map(|r| r.ok().flatten()) {
-                        local_checkpoints.insert(res.0, res.1);
-                    }
-                }
-                local_checkpoints
-            });
-
-            let spot_backfill = tokio::spawn(async move {
-                let mut local_checkpoints: BTreeMap<String, u64> = BTreeMap::new();
-                let folder = format!("./{}", market_str(MarketType::Spot));
-                if let Ok(entries) = fs::read_dir(&folder) {
-                    let mut tasks = Vec::new();
-                    for entry in entries.filter_map(Result::ok) {
-                        let path = entry.path();
-                        if path.extension().and_then(|s| s.to_str()) == Some("csv") {
-                            let file_path = path.to_str().unwrap().to_string();
-                            let symbol = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
-                            let rate_limiter = spot_rate_limiter_for_spot.clone();
-                            let http_client = http_client_for_spot.clone();
-                            let checkpoint_log_buffer = checkpoint_log_buffer_for_spot.clone();
-                            let task = tokio::spawn(async move {
-                                match process_csv_file(file_path, symbol.clone(), MarketType::Spot, http_client, rate_limiter, checkpoint_log_buffer.clone()).await {
-                                    Ok(new_checkpoint) => {
-                                        push_log(&checkpoint_log_buffer, format!("Data gaps filled. Checkpoint updated for {} {} to {}", market_str_short(MarketType::Spot), symbol, new_checkpoint)).await;
-                                        Some((format!("{}:{}", symbol, market_str(MarketType::Spot)), new_checkpoint))
-                                    },
-                                    Err(e) => {
-                                        push_log(&checkpoint_log_buffer, format!("Error processing file {}: {}", path.to_str().unwrap(), e)).await;
-                                        None
-                                    }
-                                }
-                            });
-                            tasks.push(task);
-                        }
-                    }
-                    let results = join_all(tasks).await;
-                    for res in results.into_iter().filter_map(|r| r.ok().flatten()) {
-                        local_checkpoints.insert(res.0, res.1);
-                    }
-                }
-                local_checkpoints
-            });
-
-            let futures_checkpoints = futures_backfill.await.unwrap();
-            let spot_checkpoints = spot_backfill.await.unwrap();
-            let mut combined_checkpoints = futures_checkpoints;
-            combined_checkpoints.extend(spot_checkpoints);
-
-            if let Err(e) = update_checkpoint_file(&combined_checkpoints, "checkpoint.json") {
-                push_log(&outer_checkpoint_log_buffer, format!("Error updating checkpoint.json: {}", e)).await;
-            } else {
-                push_log(&outer_checkpoint_log_buffer, "Checkpoints updated successfully.".to_string()).await;
+                // sleep for 30 minutes before checking again
+                tokio::time::sleep(Duration::from_secs(1800)).await;
             }
         });
     }
@@ -1091,6 +1026,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    stdout.execute(LeaveAlternateScreen)?;
+    // stdout.execute(LeaveAlternateScreen)?;
     Ok(())
 }
