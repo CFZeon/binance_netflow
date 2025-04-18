@@ -226,7 +226,7 @@ async fn update_clickhouse(mut clickhouse_inserter: clickhouse::inserter::Insert
     
     if stats.rows > 0 {
         println!(
-            "{} bytes, {} rows, {} transactions have been inserted",
+            "backfilling: {} bytes, {} rows, {} transactions have been inserted",
             stats.bytes, stats.rows, stats.transactions,
         );
     }
@@ -1004,18 +1004,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     {
+        let temp_clickhouse_client = clickhouse_client.clone();
+        let temp_http_client = http_client.clone();
         // this part here will be for fetching gaps in the data, fetching the data from binance, then updating the rows
         tokio::spawn(async move {
             loop {
-                println!("Handling gaps now");
                 let futures_rate_limiter = futures_rate_limiter.clone();
-                let spot_rate_limiter = spot_rate_limiter.clone();
-                handle_gaps_in_data(MarketType::Futures, clickhouse_client.clone(), &http_client, futures_rate_limiter).await;
-                handle_gaps_in_data(MarketType::Spot, clickhouse_client.clone(), &http_client, spot_rate_limiter).await;
-                println!("Gaps handled");
+                handle_gaps_in_data(MarketType::Futures, temp_clickhouse_client.clone(), &temp_http_client, futures_rate_limiter).await;
 
                 // sleep for 30 minutes before checking again
-                tokio::time::sleep(Duration::from_secs(1800)).await;
+                tokio::time::sleep(Duration::from_secs(180)).await;
+            }
+        });
+    }
+
+    {
+        // this part here will be for fetching gaps in the data, fetching the data from binance, then updating the rows
+        tokio::spawn(async move {
+            loop {
+                let spot_rate_limiter = spot_rate_limiter.clone();
+                handle_gaps_in_data(MarketType::Spot, clickhouse_client.clone(), &http_client, spot_rate_limiter).await;
+
+                // sleep for 30 minutes before checking again
+                tokio::time::sleep(Duration::from_secs(180)).await;
             }
         });
     }
