@@ -236,8 +236,8 @@ async fn update_clickhouse(mut clickhouse_inserter: clickhouse::inserter::Insert
 async fn handle_gaps_in_data(market: MarketType, clickhouse_client: clickhouse::Client, http_client: &reqwest::Client, rate_limiter: Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>) {
     loop {
         // fetch new data from clickhouse between rows where the gap is > 1
-        let mut cursor = clickhouse_client
-            .query("SELECT
+        let market_type = market_str(market);
+        let query_str = format!("SELECT
                     symbol,
                     first.1 AS timestamp_first,
                     first.2 AS start_atid_first,
@@ -251,13 +251,15 @@ async fn handle_gaps_in_data(market: MarketType, clickhouse_client: clickhouse::
                     SELECT
                         symbol,
                         groupArray((timestamp, start_atid, end_atid, net_flow)) AS rows
-                    FROM NETFLOWS_base
+                    FROM binance_NETFLOWS{}_base
                     GROUP BY symbol
                 ) AS grouped
                 ARRAY JOIN
                     arraySlice(rows, 1, length(rows) - 1) AS first,
                     arraySlice(rows, 2, length(rows) - 1) AS second
-                WHERE second.2 - first.3 > 1 AND symbol = 'BTCUSDT'")
+                WHERE second.2 - first.3 > 1 AND symbol = 'BTCUSDT'", market_type);
+        let mut cursor = clickhouse_client
+            .query(&query_str)
             .fetch::<NetflowGapsRow>().unwrap();
 
         // for each row, push it into an array
@@ -291,14 +293,14 @@ async fn handle_gaps_in_data(market: MarketType, clickhouse_client: clickhouse::
         
         let clickhouse_inserter: clickhouse::inserter::Inserter<NetflowRow>;
         if market == MarketType::Futures {
-            clickhouse_inserter = clickhouse_client.inserter::<NetflowRow>("NETFLOWS_base").unwrap()
+            clickhouse_inserter = clickhouse_client.inserter::<NetflowRow>("binance_NETFLOWS_futures_base").unwrap()
                 .with_timeouts(Some(Duration::from_secs(5)), Some(Duration::from_secs(20)))
                 .with_max_bytes(50_000_000)
                 .with_max_rows(750_000)
                 .with_period(Some(Duration::from_secs(15)));
         }
         else {
-            clickhouse_inserter = clickhouse_client.inserter::<NetflowRow>("NETFLOWS_base_spot").unwrap()
+            clickhouse_inserter = clickhouse_client.inserter::<NetflowRow>("binance_NETFLOWS_spot_base").unwrap()
                 .with_timeouts(Some(Duration::from_secs(5)), Some(Duration::from_secs(20)))
                 .with_max_bytes(50_000_000)
                 .with_max_rows(750_000)
@@ -449,7 +451,7 @@ async fn fetch_usdt_symbols(client: &reqwest::Client, is_futures: bool) -> Resul
 
 fn market_str(market: MarketType) -> &'static str {
     match market {
-        MarketType::Futures => "",
+        MarketType::Futures => "_futures",
         MarketType::Spot => "_spot",
     }
 }
@@ -787,13 +789,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let proc_log_buffer = log_buffer.clone();
 
 
-        let mut clickhouse_inserter = clickhouse_client.inserter::<NetflowRow>("NETFLOWS_base")?
+        let mut clickhouse_inserter = clickhouse_client.inserter::<NetflowRow>("binance_NETFLOWS_futures_base")?
             .with_timeouts(Some(Duration::from_secs(5)), Some(Duration::from_secs(20)))
             .with_max_bytes(50_000_000)
             .with_max_rows(750_000)
             .with_period(Some(Duration::from_secs(15)));
 
-        let mut clickhouse_inserter_spot = clickhouse_client.inserter::<NetflowRow>("NETFLOWS_base_spot")?
+        let mut clickhouse_inserter_spot = clickhouse_client.inserter::<NetflowRow>("binance_NETFLOWS_spot_base")?
             .with_timeouts(Some(Duration::from_secs(5)), Some(Duration::from_secs(20)))
             .with_max_bytes(50_000_000)
             .with_max_rows(750_000)
