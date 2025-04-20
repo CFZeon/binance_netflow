@@ -58,7 +58,7 @@ struct NetflowGapsRow {
 // Global constants & types
 // ------------------------
 
-static API_LOG_ENABLED: AtomicBool = AtomicBool::new(true);
+static API_LOG_ENABLED: AtomicBool = AtomicBool::new(false);
 
 const MAX_STREAMS_PER_CONNECTION: usize = 100;
 const MAX_RECONNECT_ATTEMPTS: u32 = 5;
@@ -678,7 +678,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Process command-line arguments.
     let args: Vec<String> = env::args().collect();
-    let mut disable_api_log = false;
+    let mut disable_api_log = true;
     for arg in args.iter().skip(1) {
         match arg.as_str() {
             "--disable-api-log" => disable_api_log = true,
