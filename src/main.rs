@@ -164,26 +164,6 @@ async fn push_log(log_buffer: &Arc<Mutex<VecDeque<String>>>, msg: String) {
     }
 }
 
-// fn format_duration_millis(duration: Duration) -> String {
-//     format!("{}ms", duration.as_millis())
-// }
-
-// fn format_duration_seconds(duration: Duration) -> String {
-//     let secs = duration.as_secs();
-//     if secs < 60 {
-//         format!("{}s", secs)
-//     } else if secs < 3600 {
-//         let minutes = secs / 60;
-//         let seconds = secs % 60;
-//         format!("{}m {}s", minutes, seconds)
-//     } else {
-//         let hours = secs / 3600;
-//         let minutes = (secs % 3600) / 60;
-//         let seconds = secs % 60;
-//         format!("{}h {}m {}s", hours, minutes, seconds)
-//     }
-// }
-
 fn aggregate_missing_trades(trades: &[AggTrade]) -> BTreeMap<u64, AggTradeAggregate> {
     let mut aggregates = BTreeMap::new();
     for trade in trades {
@@ -294,17 +274,17 @@ async fn handle_gaps_in_data(market: MarketType, clickhouse_client: clickhouse::
         let clickhouse_inserter: clickhouse::inserter::Inserter<NetflowRow>;
         if market == MarketType::Futures {
             clickhouse_inserter = clickhouse_client.inserter::<NetflowRow>("binance_NETFLOWS_futures_base").unwrap()
-                .with_timeouts(Some(Duration::from_secs(5)), Some(Duration::from_secs(20)))
+                .with_timeouts(Some(Duration::from_secs(30)), Some(Duration::from_secs(30)))
                 .with_max_bytes(50_000_000)
                 .with_max_rows(750_000)
-                .with_period(Some(Duration::from_secs(15)));
+                .with_period(Some(Duration::from_secs(30)));
         }
         else {
             clickhouse_inserter = clickhouse_client.inserter::<NetflowRow>("binance_NETFLOWS_spot_base").unwrap()
-                .with_timeouts(Some(Duration::from_secs(5)), Some(Duration::from_secs(20)))
+                .with_timeouts(Some(Duration::from_secs(30)), Some(Duration::from_secs(30)))
                 .with_max_bytes(50_000_000)
                 .with_max_rows(750_000)
-                .with_period(Some(Duration::from_secs(15)));
+                .with_period(Some(Duration::from_secs(30)));
         }
 
         // println!("{:#?}", new_aggregates);
@@ -790,16 +770,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 
         let mut clickhouse_inserter = clickhouse_client.inserter::<NetflowRow>("binance_NETFLOWS_futures_base")?
-            .with_timeouts(Some(Duration::from_secs(5)), Some(Duration::from_secs(20)))
+            .with_timeouts(Some(Duration::from_secs(30)), Some(Duration::from_secs(30)))
             .with_max_bytes(50_000_000)
             .with_max_rows(750_000)
-            .with_period(Some(Duration::from_secs(15)));
+            .with_period(Some(Duration::from_secs(30)));
 
         let mut clickhouse_inserter_spot = clickhouse_client.inserter::<NetflowRow>("binance_NETFLOWS_spot_base")?
-            .with_timeouts(Some(Duration::from_secs(5)), Some(Duration::from_secs(20)))
+            .with_timeouts(Some(Duration::from_secs(30)), Some(Duration::from_secs(30)))
             .with_max_bytes(50_000_000)
             .with_max_rows(750_000)
-            .with_period(Some(Duration::from_secs(15)));
+            .with_period(Some(Duration::from_secs(30)));
         
         tokio::spawn(async move {
             let mut flush_interval = tokio::time::interval(Duration::from_secs(6));
