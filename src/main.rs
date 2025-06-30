@@ -706,7 +706,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         missing_gaps: AtomicUsize::new(0),
         gaps_in_queue: AtomicUsize::new(0),
     });
-
+    let active_gap_fetches = Arc::new(AtomicUsize::new(0));
     let futures_symbols_list = Arc::new(Mutex::new(Vec::<String>::new()));
     let spot_symbols_list = Arc::new(Mutex::new(Vec::<String>::new()));
     let (futures_ws_version_tx, _) = tokio::sync::watch::channel(0);
@@ -830,6 +830,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             push_log(&proc_log_buffer, format!("Detected gap in {} {}: {} to {}", market_str(market), s, missing_start, missing_end)).await;
                             metrics_clone.missing_gaps.fetch_add(1, Ordering::Relaxed);
                             metrics_clone.gaps_in_queue.fetch_add(1, Ordering::Relaxed);
+
+                            let active_fetches_clone = active_gap_fetches.clone();
+
                             let http_client_inner = http_client.clone();
                             let symbol_for_fetch = s.clone();
                             let rate_limiter = match market {
@@ -839,6 +842,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let missing_trade_sender_clone = missing_trade_sender.clone();
                             let metrics_inner = metrics_clone.clone();
                             let proc_log_buffer_inner = proc_log_buffer.clone();
+
+                            active_fetches_clone.fetch_add(1, Ordering::Relaxed);
+                            println!(
+                                "[MEMORY_DEBUG] Spawning gap-fetch task for {} ({}-{}). Active tasks: {}",
+                                symbol_for_fetch, missing_start, missing_end, active_fetches_clone.load(Ordering::Relaxed)
+                            );
+                            
                             tokio::spawn(async move {
                                 let mut retry_delay = Duration::from_secs(5);
                                 loop {
