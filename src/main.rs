@@ -254,6 +254,11 @@ async fn handle_gaps_in_data(market: MarketType, clickhouse_client: clickhouse::
             loop {
                 match fetch_missing_agg_trades(&http_client, &symbol, market, missing_start, missing_end, rate_limiter.clone()).await {
                     Ok(trades) => {
+                        println!(
+                            "[MEMORY_DEBUG] GAP FILL: Fetched {} trades for gap in symbol {}. About to extend Vec.",
+                            trades.len(),
+                            symbol
+                        );
                         combined_missing_trades.extend(trades);
                         break;
                     }
@@ -863,6 +868,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     },
                     _ = flush_interval.tick() => {
+                        let channel_len = trade_data_receiver.len();
+                        // Log only if the buffer is getting noticeably full to avoid spam
+                        if channel_len > 100_000 {
+                            println!(
+                                "[MEMORY_DEBUG] MPSC channel buffer is high: {} / {}",
+                                channel_len, MAX_BUFFERED_RECORDS
+                            );
+                        }
+
+                        { // Scoped lock to check map size
+                            let aggregates_lock = trade_aggregates.lock().await;
+                            let map_size = aggregates_lock.len();
+                            if map_size > 50_000 { // Log if map size is unusually large
+                                println!("[MEMORY_DEBUG] Aggregates BTreeMap size is high: {}", map_size);
+                            }
+                        }
                         let now_unix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                         let mut aggregates_to_flush = Vec::new();
                         {
