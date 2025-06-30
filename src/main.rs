@@ -924,15 +924,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let stats = clickhouse_inserter.commit().await.unwrap();
                             if stats.rows > 0 {
                                 println!(
-                                    "{} bytes, {} rows, {} transactions have been inserted for {}",
-                                    stats.bytes, stats.rows, stats.transactions, symbol.clone()
+                                    "{} bytes, {} rows, {} transactions have been inserted",
+                                    stats.bytes, stats.rows, stats.transactions
                                 );
                             }
                             let spot_stats = clickhouse_inserter_spot.commit().await.unwrap();
                             if spot_stats.rows > 0 {
                                 println!(
-                                    "{} bytes, {} rows, {} transactions have been inserted for {}",
-                                    spot_stats.bytes, spot_stats.rows, spot_stats.transactions, symbol.clone()
+                                    "{} bytes, {} rows, {} transactions have been inserted",
+                                    spot_stats.bytes, spot_stats.rows, spot_stats.transactions
                                 );
                             }
                             let flush_duration = Instant::now().duration_since(flush_start);
