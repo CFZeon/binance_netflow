@@ -144,21 +144,19 @@ async def handle_gap_filling(market_type: str, client: clickhouse_connect.driver
     # This query is a direct translation of the one in the Rust code.
     # It finds adjacent rows where the next start_atid is not end_atid + 1.
     gap_query = f"""
-    SELECT
-        symbol,
-        first.3 + 1 AS missing_start,
-        second.2 - 1 AS missing_end
-    FROM (
+    WITH data_with_prev_end_atid AS (
         SELECT
             symbol,
-            groupArray((timestamp, start_atid, end_atid, net_flow)) AS rows
-        FROM {table_name}
-        GROUP BY symbol
+            any(end_atid) OVER (PARTITION BY symbol ORDER BY start_atid ROWS BETWEEN 1 PRECEDING AND 1 PRECEDING) AS prev_end_atid,
+            start_atid
+        FROM binance_NETFLOWS_spot_base
+        WHERE start_atid != 0 AND end_atid != 0 AND timestamp >= now() - INTERVAL 2 MONTH
+        ORDER BY symbol, timestamp DESC
     )
-    ARRAY JOIN
-        arraySlice(rows, 1, length(rows) - 1) AS first,
-        arraySlice(rows, 2, length(rows) - 1) AS second
-    WHERE second.2 - first.3 > 1
+    SELECT * 
+    FROM data_with_prev_end_atid
+    WHERE start_atid - prev_end_atid > 1 AND prev_end_atid != 0
+    ORDER BY symbol, start_atid;
     """
 
     while True:
