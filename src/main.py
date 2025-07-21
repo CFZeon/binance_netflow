@@ -149,7 +149,7 @@ async def handle_gap_filling(market_type: str, client: clickhouse_connect.driver
             symbol,
             any(end_atid) OVER (PARTITION BY symbol ORDER BY start_atid ROWS BETWEEN 1 PRECEDING AND 1 PRECEDING) AS prev_end_atid,
             start_atid
-        FROM binance_NETFLOWS_spot_base
+        FROM {table_name}
         WHERE start_atid != 0 AND end_atid != 0 AND timestamp >= now() - INTERVAL 2 MONTH
         ORDER BY symbol, timestamp DESC
     )
