@@ -295,7 +295,6 @@ async def process_queue_and_gaps(queue: asyncio.Queue, aggregates: dict, last_tr
             aggregates[agg_key] = AggTradeAggregate(symbol=trade.symbol.upper())
 
         agg = aggregates[agg_key]
-        agg.count += 1
         if trade.is_market_maker:
             agg.pos_flow += trade.price * trade.quantity
             agg.pos_qty += trade.quantity

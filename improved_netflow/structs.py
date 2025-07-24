@@ -21,7 +21,6 @@ class AggTradeAggregate:
     neg_qty: float = 0.0
     start_atid: int | None = None
     end_atid: int | None = None
-    count: int = 0
     
 @dataclass
 class FlowRow:

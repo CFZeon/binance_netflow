@@ -85,8 +85,7 @@ async def handle_gap_filling(market_type: str, client: clickhouse_connect.driver
     the missing data from Binance REST API.
     """
     rate_limiter = RATE_LIMIT_FUTURES if market_type == 'futures' else RATE_LIMIT_SPOT
-    table_suffix = "_futures" if market_type == 'futures' else "_spot"
-    table_name = f'binance_FLOWS{table_suffix}_base'
+    table_name = f'binance_FLOWS_{market_type}_base'
     
     # It finds adjacent rows where the next start_atid is not end_atid + 1.
     gap_query = f"""
@@ -115,21 +114,21 @@ async def handle_gap_filling(market_type: str, client: clickhouse_connect.driver
                 logging.info(f"[{market_type.upper()}] No gaps found.")
             else:
                 logging.info(f"[{market_type.upper()}] Found {len(gaps)} gaps to fill.")
-                # all_missing_trades = []
+                all_missing_trades = []
                 for symbol, start_id, end_id in gaps:
                     try:
                         trades = await fetch_missing_agg_trades(
                             session, symbol.upper(), market_type, start_id, end_id, rate_limiter
                         )
-                        # all_missing_trades.extend(trades)
-                        await process_backfilled_trades(trades, client, market_type)
+                        all_missing_trades.extend(trades)
+                        # await process_backfilled_trades(trades, client, market_type)
                         logging.info(f"[{market_type.upper()}] Fetched {len(trades)} trades for gap in {symbol.upper()} ({start_id}-{end_id}).")
                     except Exception as e:
                         logging.error(f"[{market_type.upper()}] Error fetching gap for {symbol.upper()}: {e}")
 
-                # if all_missing_trades:
-                #     # Aggregate and insert the backfilled data
-                #     await process_backfilled_trades(all_missing_trades, client, market_type)
+                if all_missing_trades:
+                    # Aggregate and insert the backfilled data
+                    await process_backfilled_trades(all_missing_trades, client, market_type)
 
         except Exception as e:
             logging.error(f"[{market_type.upper()}] An error occurred during gap filling: {e}")
@@ -140,8 +139,7 @@ async def handle_gap_filling(market_type: str, client: clickhouse_connect.driver
 async def process_backfilled_trades(trades: list[AggTrade], client: clickhouse_connect.driver.Client, market_type: str):
     """Aggregates and inserts trades that were fetched to fill gaps."""
     aggregates = defaultdict(lambda: AggTradeAggregate(symbol=""))
-    table_suffix = "_futures" if market_type == 'futures' else "_spot"
-    table_name = f'binance_FLOWS{table_suffix}_base'
+    table_name = f'binance_FLOWS_{market_type}_base'
     
     column_names = ['symbol', 'timestamp', 'start_atid', 'end_atid', 'pos_flow', 'pos_qty', 'neg_flow', 'neg_qty']
     
@@ -149,13 +147,21 @@ async def process_backfilled_trades(trades: list[AggTrade], client: clickhouse_c
     # fetch that trade from clickhouse if not already fetched
     # add to the aggregates for that row
     # if timestamp falls on new minute, flush the row to clickhouse
+    row_buffer = (0, 0) # placeholder to ensure nothing breaks
     for trade in trades:
         trade_minute_ts = (trade.trade_timestamp_ms // 1000 // 60) * 60
+        if trade_minute_ts != row_buffer[1]:
+            if not (trade.symbol.upper(), trade_minute_ts) in aggregates:
+                # fetch new row
+                row_buffer = list(client.query(f"""SELECT * FROM {table_name} WHERE symbol = '{agg.symbol}' AND timestamp = {trade_minute_ts}""").result_rows()[0])
+                aggregates[(trade.symbol.upper(), trade_minute_ts)] = AggTradeAggregate(symbol=trade.symbol.upper(), start_atid=row_buffer[2], 
+                                                                                        end_atid=row_buffer[3], pos_flow=row_buffer[4], 
+                                                                                        pos_qty=row_buffer[5], neg_flow=row_buffer[6], 
+                                                                                        neg_qty=row_buffer[7])
         agg_key = (trade.symbol.upper(), trade_minute_ts)
         
         agg = aggregates[agg_key]
         agg.symbol = trade.symbol.upper()
-        agg.count += 1
         if trade.is_market_maker:
             agg.pos_flow += trade.price * trade.quantity
         else:
