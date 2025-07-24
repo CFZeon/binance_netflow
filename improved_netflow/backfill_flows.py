@@ -101,7 +101,7 @@ async def handle_gap_filling(market_type: str, client: clickhouse_connect.driver
     SELECT * 
     FROM data_with_prev_end_atid
     WHERE start_atid - prev_end_atid > 1 AND prev_end_atid != 0
-    ORDER BY symbol, start_atid;
+    ORDER BY symbol, start_atid
     """
 
     while True:
@@ -164,8 +164,10 @@ async def process_backfilled_trades(trades: list[AggTrade], client: clickhouse_c
         agg.symbol = trade.symbol.upper()
         if trade.is_market_maker:
             agg.pos_flow += trade.price * trade.quantity
+            agg.pos_qty += trade.quantity
         else:
             agg.neg_flow += trade.price * trade.quantity
+            agg.neg_qty += trade.quantity
         
         if agg.start_atid is None or trade.agg_trade_id < agg.start_atid:
             agg.start_atid = trade.agg_trade_id

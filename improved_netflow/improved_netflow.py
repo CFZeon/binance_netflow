@@ -179,7 +179,7 @@ class SymbolManager:
 
     async def run(self):
         """Main loop to periodically refresh symbols and restart connections."""
-        await self.refresh_symbols()
+        self.active_symbols = set(await fetch_usdt_symbols(self.session, self.market_type))
         while True:
             try:
                 tasks = []
@@ -187,7 +187,7 @@ class SymbolManager:
                 tasks.append(self.run_ws())
                 await asyncio.gather(*tasks)
             except Exception as e:
-                print(e)
+                print(f"Error encountered: {e}")
                 await asyncio.sleep(30) # sleep for 30 seconds if anything happens then try again
     
     async def run_ws(self):
@@ -205,7 +205,7 @@ class SymbolManager:
                     self.stop_events.append(stop_event)
                     self.ws_tasks.append(run_ws_connection(self.market_type, chunk, self.queue, stop_event))
                 logging.info(f"[{self.market_type.upper()}] Spawned {len(self.ws_tasks)} new WebSocket tasks.")
-                asyncio.gather(*self.ws_tasks, return_exceptions=True)
+                await asyncio.gather(*self.ws_tasks, return_exceptions=True)
             except Exception as e:
                 print(f"Error encountered in websocket: {e}")
                 await asyncio.sleep(30)
@@ -214,6 +214,7 @@ class SymbolManager:
         while True:
             try:
                 """Fetches the latest symbols, compares with current ones, and restarts connections if needed."""
+                await asyncio.sleep(SYMBOL_REFRESH_INTERVAL_S)
                 logging.info(f"[{self.market_type.upper()}] Refreshing symbol list...")
                 new_symbols_list = await fetch_usdt_symbols(self.session, self.market_type)
                 if not new_symbols_list:
@@ -232,7 +233,6 @@ class SymbolManager:
                     event.set()
                     
                 self.active_symbols = new_symbols_set
-                await asyncio.sleep(SYMBOL_REFRESH_INTERVAL_S)
             except Exception as e:
                 print(f"Error encountered while refreshing symbols: {e}")
 
@@ -258,7 +258,6 @@ async def trade_processor(queue: asyncio.Queue, client: clickhouse_connect.drive
 
             # Short sleep to prevent a busy loop when the queue is empty
             await asyncio.sleep(0.1)
-            print(len(aggregates))
 
         except Exception as e:
             logging.error(f"FATAL error in trade_processor: {e}")

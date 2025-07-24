@@ -12,7 +12,7 @@ def createFlowsTableWithSymbol(client, source, marketType, timezone='UTC'):
         neg_qty Float64
     ) ENGINE = ReplacingMergeTree()
     PARTITION BY toStartOfWeek(timestamp)
-    ORDER BY (symbol, timestamp);
+    ORDER BY (symbol, timestamp)
     """
 
     client.command(query)
