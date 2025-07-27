@@ -147,20 +147,19 @@ async def process_backfilled_trades(trades: list[AggTrade], client: clickhouse_c
     # fetch that trade from clickhouse if not already fetched
     # add to the aggregates for that row
     # if timestamp falls on new minute, flush the row to clickhouse
-    row_buffer = (0, 0) # placeholder to ensure nothing breaks
     for trade in trades:
         trade_minute_ts = (trade.trade_timestamp_ms // 1000 // 60) * 60
-        if trade_minute_ts != row_buffer[1]:
-            if not (trade.symbol.upper(), trade_minute_ts) in aggregates:
-                # fetch new row
-                row_buffer = list(client.query(f"""SELECT * FROM {table_name} WHERE symbol = '{agg.symbol}' AND timestamp = {trade_minute_ts}""").result_rows()[0])
-                if len(row_buffer) > 0:
-                    aggregates[(trade.symbol.upper(), trade_minute_ts)] = AggTradeAggregate(symbol=trade.symbol.upper(), start_atid=row_buffer[2], 
-                                                                                        end_atid=row_buffer[3], pos_flow=row_buffer[4], 
-                                                                                        pos_qty=row_buffer[5], neg_flow=row_buffer[6], 
-                                                                                        neg_qty=row_buffer[7])
-                else:
-                    aggregates[(trade.symbol.upper(), trade_minute_ts)] = AggTradeAggregate(symbol=trade.symbol.upper())
+        if not (trade.symbol.upper(), trade_minute_ts) in aggregates:
+            # fetch new row
+            row_buffer = client.query(f"""SELECT * FROM {table_name} WHERE symbol = '{trade.symbol.upper()}' AND timestamp = {trade_minute_ts}""").result_rows
+            if len(row_buffer) > 0:
+                row_buffer = row_buffer[0]
+                aggregates[(trade.symbol.upper(), trade_minute_ts)] = AggTradeAggregate(symbol=trade.symbol.upper(), start_atid=row_buffer[2], 
+                                                                                    end_atid=row_buffer[3], pos_flow=row_buffer[4], 
+                                                                                    pos_qty=row_buffer[5], neg_flow=row_buffer[6], 
+                                                                                    neg_qty=row_buffer[7])
+            else:
+                aggregates[(trade.symbol.upper(), trade_minute_ts)] = AggTradeAggregate(symbol=trade.symbol.upper())
         agg_key = (trade.symbol.upper(), trade_minute_ts)
         
         agg = aggregates[agg_key]

@@ -12,20 +12,11 @@ import logging
 from structs import AggTradeAggregate, AggTrade
 
 from backfill_flows import handle_gap_filling
-
-# Set to False to enable detailed API request/response logging to 'api_requests.log'
-
 # Binance API and WebSocket Configuration
 MAX_STREAMS_PER_CONNECTION = 100
 MAX_RECONNECT_ATTEMPTS = 5
 BASE_RECONNECT_DELAY_S = 1
 MAX_TRADES_PER_REQUEST = 1000
-
-# Rate limiters (requests per second)
-# Note: Binance weights are complex. These are simplified limits.
-# Check https://binance-docs.github.io/apidocs/spot/en/#limits
-RATE_LIMIT_FUTURES = AsyncLimiter(2, 1)  # A safe, low number
-RATE_LIMIT_SPOT = AsyncLimiter(25, 1) # A generous limit for multiple requests
 
 # Data Processing Configuration
 MAX_BUFFERED_RECORDS = 1_000_000  # Max size for the internal asyncio.Queue
