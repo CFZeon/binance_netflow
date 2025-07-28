@@ -165,11 +165,11 @@ async def process_backfilled_trades(trades: list[AggTrade], client: clickhouse_c
         agg = aggregates[agg_key]
         agg.symbol = trade.symbol.upper()
         if trade.is_market_maker:
-            agg.pos_flow += trade.price * trade.quantity
-            agg.pos_qty += trade.quantity
-        else:
             agg.neg_flow += trade.price * trade.quantity
             agg.neg_qty += trade.quantity
+        else:
+            agg.pos_flow += trade.price * trade.quantity
+            agg.pos_qty += trade.quantity
         
         if agg.start_atid is None or trade.agg_trade_id < agg.start_atid:
             agg.start_atid = trade.agg_trade_id
