@@ -89,21 +89,20 @@ async def handle_gap_filling(market_type: str, client: clickhouse_connect.driver
     
     # It finds adjacent rows where the next start_atid is not end_atid + 1.
     gap_query = f"""
-    WITH data_with_prev_end_atid AS (
+    WITH data_with_gaps AS (
         SELECT
             symbol,
-            any(end_atid) OVER (PARTITION BY symbol ORDER BY start_atid ROWS BETWEEN 1 PRECEDING AND 1 PRECEDING) AS prev_end_atid,
-            start_atid
+            (any(end_atid) OVER (PARTITION BY symbol ORDER BY start_atid ROWS BETWEEN 1 PRECEDING AND 1 PRECEDING) + 1) AS gap_start,
+            (start_atid - 1) AS gap_end
         FROM {table_name}
         WHERE start_atid != 0 AND end_atid != 0 AND timestamp >= now() - INTERVAL 2 MONTH
         ORDER BY symbol, timestamp DESC
     )
     SELECT * 
-    FROM data_with_prev_end_atid
-    WHERE start_atid - prev_end_atid > 1 AND prev_end_atid != 0
-    ORDER BY symbol, start_atid
+    FROM data_with_gaps
+    WHERE gap_end >= gap_start AND gap_start != 1 AND gap_end != 0
+    ORDER BY symbol, gap_start
     """
-
     while True:
         try:
             logging.info(f"[{market_type.upper()}] Checking for data gaps in {table_name}...")
@@ -114,21 +113,21 @@ async def handle_gap_filling(market_type: str, client: clickhouse_connect.driver
                 logging.info(f"[{market_type.upper()}] No gaps found.")
             else:
                 logging.info(f"[{market_type.upper()}] Found {len(gaps)} gaps to fill.")
-                all_missing_trades = []
+                # all_missing_trades = []
                 for symbol, start_id, end_id in gaps:
                     try:
                         trades = await fetch_missing_agg_trades(
                             session, symbol.upper(), market_type, start_id, end_id, rate_limiter
                         )
-                        all_missing_trades.extend(trades)
-                        # await process_backfilled_trades(trades, client, market_type)
+                        # all_missing_trades.extend(trades)
+                        await process_backfilled_trades(trades, client, market_type)
                         logging.info(f"[{market_type.upper()}] Fetched {len(trades)} trades for gap in {symbol.upper()} ({start_id}-{end_id}).")
                     except Exception as e:
                         logging.error(f"[{market_type.upper()}] Error fetching gap for {symbol.upper()}: {e}")
 
-                if all_missing_trades:
+                # if all_missing_trades:
                     # Aggregate and insert the backfilled data
-                    await process_backfilled_trades(all_missing_trades, client, market_type)
+                    # await process_backfilled_trades(all_missing_trades, client, market_type)
 
         except Exception as e:
             logging.error(f"[{market_type.upper()}] An error occurred during gap filling: {e}")

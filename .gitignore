@@ -3,3 +3,5 @@ encrypted_dot_DS_Store.age
 target
 Cargo.lock
 **/*.log
+**/*.pyc
+**/__pycache__
